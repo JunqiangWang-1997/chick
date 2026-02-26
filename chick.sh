@@ -4,6 +4,8 @@ set -euo pipefail
 CONFIG_FILE="/etc/chick.conf"
 STATE_DIR="/var/lib/mkchick"
 NEXT_FILE="$STATE_DIR/next_hex"
+CHICKS_FILE="$STATE_DIR/chicks.tsv"
+DEFAULT_IMAGE="images:alpine/3.21"
 
 UPLINK="eth1"
 LAN_NET="lan0"
@@ -23,6 +25,57 @@ UPLINK="${UPLINK}"
 LAN_NET="${LAN_NET}"
 PUB_PREFIX="${PUB_PREFIX}"
 EOF
+}
+
+init_chicks_file() {
+  mkdir -p "$STATE_DIR"
+  if [[ ! -f "$CHICKS_FILE" ]]; then
+    printf 'name\tipv6\tlan_ipv4\tpassword\tssh_ready\tuplink\tlan_net\tcreated_at\timage\n' >"$CHICKS_FILE"
+  fi
+}
+
+upsert_chick_record() {
+  local name="$1"
+  local ipv6="$2"
+  local lan_ipv4="$3"
+  local password="$4"
+  local ssh_ready="$5"
+  local uplink="$6"
+  local lan_net="$7"
+  local created_at="$8"
+  local image="$9"
+
+  init_chicks_file
+
+  local tmp_file
+  tmp_file="$(mktemp "$STATE_DIR/chicks.XXXXXX")"
+  awk -F'\t' -v OFS='\t' -v target="$name" 'NR == 1 || $1 != target { print }' "$CHICKS_FILE" >"$tmp_file"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$name" "$ipv6" "$lan_ipv4" "$password" "$ssh_ready" "$uplink" "$lan_net" "$created_at" "$image" >>"$tmp_file"
+  mv "$tmp_file" "$CHICKS_FILE"
+}
+
+remove_chick_record() {
+  local name="$1"
+  [[ -f "$CHICKS_FILE" ]] || return 0
+
+  local tmp_file
+  tmp_file="$(mktemp "$STATE_DIR/chicks.XXXXXX")"
+  awk -F'\t' -v OFS='\t' -v target="$name" 'NR == 1 || $1 != target { print }' "$CHICKS_FILE" >"$tmp_file"
+  mv "$tmp_file" "$CHICKS_FILE"
+}
+
+detect_default_uplink() {
+  ip route 2>/dev/null | awk '
+    $1 == "default" {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "dev" && (i + 1) <= NF) {
+          print $(i + 1)
+          exit
+        }
+      }
+    }
+  '
 }
 
 require_root() {
@@ -157,7 +210,7 @@ create_chick() {
   local ipv6
   ipv6="$(allocate_ipv6)"
 
-  incus init images:alpine/3.21 "$name" >/dev/null
+  incus init "$DEFAULT_IMAGE" "$name" >/dev/null
 
   incus config device remove "$name" eth0 >/dev/null 2>&1 || true
   incus config device remove "$name" lan1 >/dev/null 2>&1 || true
@@ -211,6 +264,18 @@ ss -lnt 2>/dev/null | grep -q ':22' || netstat -lnt 2>/dev/null | grep -q ':22'
   fi
 
   lan_ip="$(incus exec "$name" -- sh -lc "ip -4 addr show dev lan1 | awk '/inet /{print \$2}' | head -n1" 2>/dev/null || true)"
+  lan_ip="${lan_ip//$'\n'/}"
+
+  upsert_chick_record \
+    "$name" \
+    "$ipv6" \
+    "${lan_ip:-pending}" \
+    "$pass" \
+    "$ssh_ok" \
+    "$UPLINK" \
+    "$LAN_NET" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "$DEFAULT_IMAGE"
 
   echo "======================================"
   echo "Container: $name"
@@ -234,7 +299,138 @@ delete_chick() {
   fi
   [[ -n "$name" ]] || { echo "Name required"; exit 1; }
   incus delete -f "$name"
+  remove_chick_record "$name"
   echo "Deleted: $name"
+}
+
+list_chicks() {
+  if [[ ! -f "$CHICKS_FILE" ]]; then
+    echo "No chick records yet. Expected file: $CHICKS_FILE"
+    return 0
+  fi
+
+  local rows
+  rows="$(awk 'END { print NR }' "$CHICKS_FILE")"
+  if [[ "$rows" -le 1 ]]; then
+    echo "No chick records yet. Expected file: $CHICKS_FILE"
+    return 0
+  fi
+
+  if command -v column >/dev/null 2>&1; then
+    column -t -s $'\t' "$CHICKS_FILE"
+  else
+    cat "$CHICKS_FILE"
+  fi
+}
+
+show_chick_info() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    read -r -p "Container name: " name
+  fi
+  [[ -n "$name" ]] || { echo "Name required"; exit 1; }
+
+  if [[ ! -f "$CHICKS_FILE" ]]; then
+    echo "No records file found: $CHICKS_FILE"
+    exit 1
+  fi
+
+  local record
+  record="$(awk -F'\t' -v target="$name" 'NR > 1 && $1 == target { print; exit }' "$CHICKS_FILE")"
+  if [[ -z "$record" ]]; then
+    echo "No record for container: $name"
+    exit 1
+  fi
+
+  local rec_name rec_ipv6 rec_lan_ipv4 rec_password rec_ssh_ready rec_uplink rec_lan_net rec_created_at rec_image
+  IFS=$'\t' read -r rec_name rec_ipv6 rec_lan_ipv4 rec_password rec_ssh_ready rec_uplink rec_lan_net rec_created_at rec_image <<<"$record"
+
+  echo "name: $rec_name"
+  echo "ipv6: $rec_ipv6"
+  echo "lan_ipv4: $rec_lan_ipv4"
+  echo "password: $rec_password"
+  echo "ssh_ready: $rec_ssh_ready"
+  echo "uplink: $rec_uplink"
+  echo "lan_net: $rec_lan_net"
+  echo "created_at: $rec_created_at"
+  echo "image: $rec_image"
+}
+
+oneshot_chick() {
+  require_root
+
+  local config_exists=0
+  if [[ -f "$CONFIG_FILE" ]]; then
+    config_exists=1
+  fi
+  load_config
+
+  local name=""
+  local uplink_arg=""
+  local lan_net_arg=""
+  local pub_prefix_arg=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --uplink)
+      [[ $# -ge 2 ]] || { echo "Missing value for --uplink"; exit 1; }
+      uplink_arg="$2"
+      shift 2
+      ;;
+    --lan-net)
+      [[ $# -ge 2 ]] || { echo "Missing value for --lan-net"; exit 1; }
+      lan_net_arg="$2"
+      shift 2
+      ;;
+    --pub-prefix)
+      [[ $# -ge 2 ]] || { echo "Missing value for --pub-prefix"; exit 1; }
+      pub_prefix_arg="$2"
+      shift 2
+      ;;
+    -h | --help)
+      echo "Usage: $0 oneshot <name> [--uplink IFACE] [--lan-net NAME] [--pub-prefix PREFIX]"
+      return 0
+      ;;
+    *)
+      if [[ -z "$name" ]]; then
+        name="$1"
+        shift
+      else
+        echo "Unknown argument: $1"
+        exit 1
+      fi
+      ;;
+    esac
+  done
+
+  [[ -n "$name" ]] || read -r -p "Container name: " name
+  [[ -n "$name" ]] || { echo "Name required"; exit 1; }
+
+  if [[ -n "$uplink_arg" ]]; then
+    UPLINK="$uplink_arg"
+  elif [[ "$config_exists" -eq 0 ]]; then
+    UPLINK="$(detect_default_uplink || true)"
+  fi
+
+  if [[ -n "$lan_net_arg" ]]; then
+    LAN_NET="$lan_net_arg"
+  fi
+
+  if [[ -n "$pub_prefix_arg" ]]; then
+    PUB_PREFIX="$pub_prefix_arg"
+  fi
+
+  if [[ -z "$PUB_PREFIX" ]]; then
+    read -r -p "Public IPv6 prefix (example: 2001:db8:1234:5678): " PUB_PREFIX
+  fi
+
+  [[ -n "$UPLINK" ]] || { echo "UPLINK is empty. Use --uplink IFACE."; exit 1; }
+  [[ -n "$LAN_NET" ]] || { echo "LAN_NET is empty. Use --lan-net NAME."; exit 1; }
+  [[ -n "$PUB_PREFIX" ]] || { echo "PUB_PREFIX is required."; exit 1; }
+
+  install_incus_and_deps
+  save_config
+  create_chick "$name"
 }
 
 show_menu() {
@@ -245,6 +441,9 @@ show_menu() {
     echo "2) Configure network (UPLINK/LAN/PUB_PREFIX)"
     echo "3) Create chick"
     echo "4) Delete chick"
+    echo "5) List chick records"
+    echo "6) Show chick record"
+    echo "7) Oneshot (install + create)"
     echo "0) Exit"
     read -r -p "Choose: " choice
 
@@ -253,6 +452,9 @@ show_menu() {
     2) configure_network ;;
     3) create_chick ;;
     4) delete_chick ;;
+    5) list_chicks ;;
+    6) show_chick_info ;;
+    7) oneshot_chick ;;
     0) exit 0 ;;
     *) echo "Invalid option" ;;
     esac
@@ -274,11 +476,21 @@ main() {
   delete)
     delete_chick "${2:-}"
     ;;
+  list)
+    list_chicks
+    ;;
+  info)
+    show_chick_info "${2:-}"
+    ;;
+  oneshot)
+    shift
+    oneshot_chick "$@"
+    ;;
   menu)
     show_menu
     ;;
   *)
-    echo "Usage: $0 [install|network|create <name>|delete <name>|menu]"
+    echo "Usage: $0 [install|network|create <name>|delete <name>|list|info <name>|oneshot <name> [--uplink IFACE] [--lan-net NAME] [--pub-prefix PREFIX]|menu]"
     exit 1
     ;;
   esac
