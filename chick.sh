@@ -179,19 +179,26 @@ allocate_ipv6() {
     exit 1
   fi
 
-  local hex ipv6
-  hex="$(cat "$NEXT_FILE" 2>/dev/null || echo 100)"
-  while true; do
-    ipv6="${PUB_PREFIX}::${hex}"
-    if ip -6 route | grep -q -F "${ipv6}/128"; then
-      hex="$(printf "%x" $((0x$hex + 1)))"
-    else
-      break
-    fi
-  done
+  (
+    flock -x 200
 
-  echo "$(printf "%x" $((0x$hex + 1)))" >"$NEXT_FILE"
-  echo "$ipv6"
+    local hex ipv6
+    hex="$(cat "$NEXT_FILE" 2>/dev/null || echo 100)"
+    # 校验 hex 格式，若损坏则重置
+    [[ "$hex" =~ ^[0-9a-fA-F]+$ ]] || hex=100
+
+    while true; do
+      ipv6="${PUB_PREFIX}::${hex}"
+      if ip -6 route | grep -q -F "${ipv6}/128"; then
+        hex="$(printf "%x" $((0x$hex + 1)))"
+      else
+        break
+      fi
+    done
+
+    printf "%x\n" $((0x$hex + 1)) >"$NEXT_FILE"
+    echo "$ipv6"
+  ) 200>"$STATE_DIR/alloc.lock"
 }
 
 create_chick() {
@@ -224,11 +231,11 @@ create_chick() {
   pass="$(openssl rand -base64 10)"
   ssh_ok="NO"
 
-  if incus exec "$name" -- sh -lc "
+  if incus exec "$name" --env "CHICK_PASS=$pass" -- sh -lc '
 set -e
 
 apk add --no-cache openrc >/dev/null 2>&1 || true
-cat >/etc/network/interfaces <<'IFACE'
+cat >/etc/network/interfaces <<IFACE
 auto lo
 iface lo inet loopback
 
@@ -245,21 +252,21 @@ for i in 1 2 3 4 5 6 7 8; do
   apk update >/dev/null 2>&1 && apk add --no-cache openssh-server >/dev/null 2>&1 && ok=1 && break
   sleep 2
 done
-[ \"\$ok\" -eq 1 ] || exit 20
+[ "$ok" -eq 1 ] || exit 20
 
-echo root:$pass | chpasswd
+printf "root:%s\n" "$CHICK_PASS" | chpasswd
 ssh-keygen -A >/dev/null 2>&1 || true
 
 if [ -f /etc/ssh/sshd_config ]; then
-  sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
-  sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+  sed -i "s/^#*PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config || true
+  sed -i "s/^#*PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config || true
 fi
 
 rc-update add sshd >/dev/null 2>&1 || true
 rc-service sshd restart >/dev/null 2>&1 || rc-service sshd start >/dev/null 2>&1 || true
 
-ss -lnt 2>/dev/null | grep -q ':22' || netstat -lnt 2>/dev/null | grep -q ':22'
-" >/dev/null 2>&1; then
+ss -lnt 2>/dev/null | grep -q ":22" || netstat -lnt 2>/dev/null | grep -q ":22"
+' >/dev/null 2>&1; then
     ssh_ok="YES"
   fi
 
